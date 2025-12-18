@@ -32,6 +32,7 @@ from tensorflow.keras.optimizers import Adam
 from statistics import mean,median
 
 
+
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
@@ -122,7 +123,7 @@ class NN(Layer):
     Neural Network Architecture for calcualting s and t for Real-NVP
   
     """
-    def __init__(self, input_shape, n_hidden=[128,128,128], activation="relu",use_bias=True,
+    def __init__(self, input_shape, output_shape = None, n_hidden=[128,128,128], activation="relu",use_bias=True,
     kernel_initializer='glorot_uniform',
     bias_initializer='zeros', kernel_regularizer=None,
     bias_regularizer=None, activity_regularizer=None, kernel_constraint=None,
@@ -132,8 +133,13 @@ class NN(Layer):
         for i, hidden in enumerate(n_hidden):
             layer_list.append(Dense(hidden, activation=activation))
         self.layer_list = layer_list
-        self.log_s_layer = Dense(input_shape, activation="tanh", name='log_s')
-        self.t_layer = Dense(input_shape, name='t')
+
+        if output_shape is not None:
+            self.log_s_layer = Dense(output_shape, activation="tanh")
+            self.t_layer = Dense(output_shape)
+        else:
+            self.log_s_layer = Dense(input_shape, activation="tanh")
+            self.t_layer = Dense(input_shape)
 
     def call(self, x):
         y = x
@@ -164,30 +170,32 @@ class RealNVP(tfb.Bijector): # type: ignore
         
         self.tran_ndims=ndims-rem_dims
         #input_shape = input_shape // 2
-        nn_layer = NN(self.tran_ndims, n_hidden,activation,use_bias,
-    kernel_initializer,
-    bias_initializer, kernel_regularizer,
-    bias_regularizer, activity_regularizer, kernel_constraint,
-    bias_constraint)
+        #! penso che sia sbagliato!! ma come faceva a funzionare prima?
+        #nn_layer = NN(rem_dims, n_hidden = n_hidden, activation = activation, use_bias = use_bias,
+        nn_layer = NN(self.tran_ndims, n_hidden = n_hidden, activation = activation, use_bias = use_bias,
+                        kernel_initializer = kernel_initializer,
+                        bias_initializer = bias_initializer, kernel_regularizer = kernel_regularizer,
+                        bias_regularizer = bias_regularizer, activity_regularizer = activity_regularizer, kernel_constraint = kernel_constraint,
+                        bias_constraint = bias_constraint)
         x = tf.keras.Input((rem_dims,))
         t,log_s = nn_layer(x)
         self.nn = Model(x, [t, log_s])
+        
 
-
-    
     def _bijector_fn(self, x):
+        #!debug
+        #print("******************inside bijector_fn")
         t, log_s = self.nn(x)
-        #print('this is t')
-        #print(t)
-        #print(tfb.affine_scalar.AffineScalar(shift=t, log_scale=log_s))
-        
-        
+
         affine_scalar=tfb.Chain([tfb.Shift(t),tfb.Scale(log_scale=log_s)])
         
         return affine_scalar
 
     def _forward(self, x):
         #x_a, x_b = tf.split(x, 2, axis=-1)
+        #!debug 
+        #print(".................inside forward")
+        #tf.print(tf.shape(x))
         x_a=x[:,:self.tran_ndims]
         x_b=x[:,self.tran_ndims:]
         #print('x_a')
@@ -201,6 +209,9 @@ class RealNVP(tfb.Bijector): # type: ignore
 
     def _inverse(self, y):
         #y_a, y_b = tf.split(y, 2, axis=-1)
+        #!debug 
+        #print(".................inside inverse")
+        #tf.print("y shape in inverse: ", tf.shape(y))
         y_a=y[:,:self.tran_ndims]
         y_b=y[:,self.tran_ndims:]
         x_b = y_b

@@ -178,14 +178,14 @@ class RationalQuadraticSpline(tfb.Bijector):
         slope `1`. `range_max` is implicit, and can be computed as `range_min +
         sum(bin_widths, axis=-1)`. Scalar floating point `Tensor`.
       validate_args: Toggles argument validation (can hurt performance).
-      name: Optional name scope for associated ops. (Defaults to
+      name: Optional name scope for associated ops. (Defaults totf.constant
         `'RationalQuadraticSpline'`).
     """
     parameters = dict(locals())
     with tf.name_scope(name or 'RationalQuadraticSpline') as name:
       dtype = dtype_util.common_dtype(
           [bin_widths, bin_heights, knot_slopes, range_min],
-          dtype_hint=tf.float32)
+          dtype_hint=tf.float64)
       self._bin_widths = tensor_util.convert_nonref_to_tensor(
           bin_widths, dtype=dtype, name='bin_widths')
       self._bin_heights = tensor_util.convert_nonref_to_tensor(
@@ -429,3 +429,170 @@ class RationalQuadraticSpline(tfb.Bijector):
               kd, message='`knot_slopes` must be positive.'),
       ]
     return assertions
+
+
+
+# ------------------------------ tail implementation ------------------------------
+
+
+
+
+class RQS_with_tails(tfb.Bijector):
+  """A piecewise rational quadratic spline with automatically derived linear tails.
+  This bijector is a modification of TFP's RationalQuadraticSpline.
+  The spline is defined on the interval [range_min, range_max], where
+  range_max is derived from range_min + sum(bin_widths). Outside this
+  interval, it behaves as a linear function with a slope matching the
+  derivative of the spline at the boundary, ensuring C1 continuity.
+  This design provides numerical stability for the entire real line, making it
+  suitable for chaining multiple such bijectors in a deep normalizing flow.
+  """
+  def __init__(self,
+               bin_widths,
+               bin_heights,
+               knot_slopes,
+               range_min=-1.,
+               tails='linear',
+               validate_args=False,
+               name=None):
+    parameters = dict(locals())
+    with tf.name_scope(name or 'RQS_with_tails') as name:
+      dtype = dtype_util.common_dtype(
+          [bin_widths, bin_heights, knot_slopes, range_min],
+          dtype_hint=tf.float64)
+      
+      self._bin_widths = tensor_util.convert_nonref_to_tensor(
+          bin_widths, dtype=dtype, name='bin_widths')
+      self._bin_heights = tensor_util.convert_nonref_to_tensor(
+          bin_heights, dtype=dtype, name='bin_heights')
+      self._knot_slopes = tensor_util.convert_nonref_to_tensor(
+          knot_slopes, dtype=dtype, name='knot_slopes')
+      self._range_min = tensor_util.convert_nonref_to_tensor(
+          range_min, dtype=dtype, name='range_min')
+      self._tails = tails
+
+      # The original TFP RQS class is used as a "delegate" for internal calculations.
+      # This avoids re-implementing the complex and validated spline logic.
+      self._spline_delegate = RationalQuadraticSpline(
+          bin_widths=self._bin_widths,
+          bin_heights=self._bin_heights,
+          knot_slopes=self._knot_slopes,
+          range_min=self._range_min,
+          validate_args=validate_args)
+
+      super(RQS_with_tails, self).__init__(
+          dtype=dtype,
+          forward_min_event_ndims=0,
+          validate_args=validate_args,
+          parameters=parameters,
+          name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        bin_widths=parameter_properties.ParameterProperties(event_ndims=1),
+        bin_heights=parameter_properties.ParameterProperties(event_ndims=1),
+        knot_slopes=parameter_properties.ParameterProperties(event_ndims=1),
+        range_min=parameter_properties.ParameterProperties())
+
+  @property
+  def bin_widths(self):
+    return self._bin_widths
+
+  @property
+  def bin_heights(self):
+    return self._bin_heights
+
+  @property
+  def knot_slopes(self):
+    return self._knot_slopes
+
+  @property
+  def range_min(self):
+    return self._range_min
+    
+  @property
+  def tails(self):
+    return self._tails
+
+  @classmethod
+  def _is_increasing(cls):
+    return True
+
+  def _forward(self, x):
+    """Compute the forward transformation with linear tails."""
+    if self.tails != 'linear':
+        return self._spline_delegate._forward(x)
+
+    lower_bound_x = self._spline_delegate.range_min
+    upper_bound_x = self._spline_delegate.range_min + tf.reduce_sum(
+        self._spline_delegate.bin_widths, axis=-1)
+
+    # Values inside the spline region
+    spline_val = self._spline_delegate._forward(x)
+
+    # Tail Logic
+    y_at_lower_bound = self._spline_delegate._forward(lower_bound_x)
+    y_at_upper_bound = self._spline_delegate._forward(upper_bound_x)
+    
+    deriv_at_lower_bound = tf.exp(self._spline_delegate._forward_log_det_jacobian(lower_bound_x))
+    deriv_at_upper_bound = tf.exp(self._spline_delegate._forward_log_det_jacobian(upper_bound_x))
+
+    lower_tail = y_at_lower_bound + (x - lower_bound_x) * deriv_at_lower_bound
+    upper_tail = y_at_upper_bound + (x - upper_bound_x) * deriv_at_upper_bound
+    
+    y = tf.where(x < lower_bound_x, lower_tail, spline_val)
+    y = tf.where(x > upper_bound_x, upper_tail, y)
+    return y
+  
+  def _inverse(self, y):
+    """Compute the inverse transformation with linear tails."""
+    if self.tails != 'linear':
+        return self._spline_delegate._inverse(y)
+
+    lower_bound_x = self._spline_delegate.range_min
+    upper_bound_x = self._spline_delegate.range_min + tf.reduce_sum(
+        self._spline_delegate.bin_widths, axis=-1)
+
+    # Values inside the spline region
+    spline_inv_val = self._spline_delegate._inverse(y)
+
+    # Tail Logic for inverse
+    y_at_lower_bound = self._spline_delegate._forward(lower_bound_x)
+    y_at_upper_bound = self._spline_delegate._forward(upper_bound_x)
+
+    deriv_at_lower_bound = tf.exp(self._spline_delegate._forward_log_det_jacobian(lower_bound_x))
+    deriv_at_upper_bound = tf.exp(self._spline_delegate._forward_log_det_jacobian(upper_bound_x))
+
+    # Add epsilon for numerical stability in case derivative is zero
+    lower_tail_inv = (y - y_at_lower_bound) / (deriv_at_lower_bound + 1e-8) + lower_bound_x
+    upper_tail_inv = (y - y_at_upper_bound) / (deriv_at_upper_bound + 1e-8) + upper_bound_x
+    
+    # NOTE: The conditions for the inverse must be on `y`, not `x`.
+    x = tf.where(y < y_at_lower_bound, lower_tail_inv, spline_inv_val)
+    x = tf.where(y > y_at_upper_bound, upper_tail_inv, x)
+    return x
+
+  def _forward_log_det_jacobian(self, x):
+    """Compute the forward log det jacobian with linear tails."""
+    if self.tails != 'linear':
+        return self._spline_delegate._forward_log_det_jacobian(x)
+        
+    lower_bound_x = self._spline_delegate.range_min
+    upper_bound_x = self._spline_delegate.range_min + tf.reduce_sum(
+        self._spline_delegate.bin_widths, axis=-1)
+
+    # Log derivative for values inside the spline region
+    log_derivative = self._spline_delegate._forward_log_det_jacobian(x)
+
+    # Tail logic for log-det-jacobian
+    log_deriv_at_lower_bound = self._spline_delegate._forward_log_det_jacobian(lower_bound_x)
+    log_deriv_at_upper_bound = self._spline_delegate._forward_log_det_jacobian(upper_bound_x)
+
+    ldj = tf.where(x < lower_bound_x, log_deriv_at_lower_bound, log_derivative)
+    ldj = tf.where(x > upper_bound_x, log_deriv_at_upper_bound, ldj)
+    return ldj
+    
+  def _parameter_control_dependencies(self, is_init):
+      # Delegate validation to the original class implementation
+      return self._spline_delegate._parameter_control_dependencies(is_init)

@@ -19,7 +19,7 @@ from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow_probability.python.math.numeric import clip_by_value_preserve_gradient
 #from tensorflow_probability.python.bijectors import RationalQuadraticSpline
-from RQS import RationalQuadraticSpline
+from RQS import RationalQuadraticSpline, RQS_with_tails
 from tensorflow.python.util import deprecation  # pylint: disable=g-direct-tensorflow-import
 
 
@@ -213,8 +213,9 @@ class MaskedAutoregressiveFlow(bijector_lib.Bijector):
                event_ndims=1,
                name=None,
                spline_knots=2,
+               tails = None,
                range_min=-1
-              ):
+               ):
     """Creates the MaskedAutoregressiveFlow bijector.
     Args:
       shift_and_log_scale_fn: Python `callable` which computes `shift` and
@@ -255,43 +256,52 @@ class MaskedAutoregressiveFlow(bijector_lib.Bijector):
     """
     parameters = dict(locals())
     name = name or 'masked_autoregressive_flow'
+    self.maf_name = name if name is not None else "unnamed_maf_spline"
     with tf.name_scope(name) as name:
       self._unroll_loop = unroll_loop
       self._event_ndims = event_ndims
       if bool(shift_and_log_scale_fn) == bool(bijector_fn):
         raise ValueError('Exactly one of `shift_and_log_scale_fn` and '
                          '`bijector_fn` should be specified.')
+      
+      
       if shift_and_log_scale_fn:
-        
         def _bijector_fn(x, **condition_kwargs):
 
             def reshape(params):
                 #print(params)
-                factor=tf.cast(2*abs(range_min),dtype=tf.float32)
+                factor=tf.cast(2*abs(range_min),dtype=tf.float64)
                 bin_widths=params[:,:,:spline_knots]
                 #bin_widths=tf.reshape(bin_widths, (x.shape[0],self.tran_ndims,spline_knots), name=None)
                 bin_widths=tf.math.softmax(bin_widths)
-                bin_widths=tf.math.scalar_mul(factor,bin_widths)
+                bin_widths=tf.math.scalar_mul(factor,bin_widths) + 1e-5 # avoid zero widths
                 #print(bin_widths)
         
                 bin_heights=params[:,:,spline_knots:spline_knots*2]
                 #bin_heights=tf.reshape(bin_heights, (x.shape[0],self.tran_ndims,spline_knots), name=None)
                 bin_heights=tf.math.softmax(bin_heights)
-                bin_heights=tf.math.scalar_mul(factor,bin_heights)
-        
+                bin_heights=tf.math.scalar_mul(factor,bin_heights) + 1e-5 # avoid zero heights
+  
                 knot_slopes=params[:,:,spline_knots*2:]
-                knot_slopes=tf.math.softplus(knot_slopes)
+                knot_slopes=tf.math.softplus(knot_slopes) + 1e-5 # avoid zero slopes
                 #knot_slopes=tf.reshape(knot_slopes, (x.shape[0],self.tran_ndims,spline_knots-1), name=None)
                 return bin_widths,bin_heights,knot_slopes
   
             params=shift_and_log_scale_fn(x, **condition_kwargs)
+            #params = tf.cast(tf.clip_by_value(params, -8., +8.), tf.float64)
             bin_widths,bin_heights,knot_slopes=reshape(params)
-      
-            return RationalQuadraticSpline(bin_widths=bin_widths, bin_heights=bin_heights, knot_slopes=knot_slopes, range_min=range_min, validate_args=False)
+
+            return RQS_with_tails(bin_widths=bin_widths,
+                                  bin_heights=bin_heights,
+                                  knot_slopes=knot_slopes,
+                                  range_min=range_min,
+                                  tails = tails, 
+                                  validate_args=validate_args
+                              )
 
         bijector_fn = _bijector_fn
-        
-      
+
+      self.custom_MAF = True
       if validate_args:
         bijector_fn = _validate_bijector_fn(bijector_fn)
       # Still do this assignment for variable tracking.
@@ -385,7 +395,7 @@ def _gen_mask(num_blocks,
               n_in,
               n_out,
               mask_type=MASK_EXCLUSIVE,
-              dtype=tf.float32):
+              dtype=tf.float64):
   """Generate the mask for building an autoregressive dense layer."""
   # TODO(b/67594795): Better support of dynamic shape.
   mask = np.zeros([n_out, n_in], dtype=dtype_util.as_numpy_dtype(dtype))
@@ -803,6 +813,7 @@ class AutoregressiveNetwork(tf.keras.layers.Layer):
                kernel_constraint=None,
                bias_constraint=None,
                validate_args=False,
+               tails = None,
                **kwargs):
     """Constructs the MADE layer.
     Args:
@@ -1050,6 +1061,233 @@ class AutoregressiveNetwork(tf.keras.layers.Layer):
   @property
   def params(self):
     return self._params
+  
+
+
+# Add this entire class to your MAF_spline.py file.
+# It is a self-contained copy of AutoregressiveNetwork with Batch Norm functionality.
+
+class AutoregressiveNetwork_batch_norm(tf.keras.layers.Layer):
+  r"""A copy of AutoregressiveNetwork that includes optional Batch Normalization.
+  This network adds a `use_batch_norm` flag to the constructor. If True, a
+  BatchNormalization layer is inserted after each hidden dense layer and
+  before the activation function.
+  """
+
+  def __init__(self,
+               params,
+               event_shape=None,
+               conditional=False,
+               conditional_event_shape=None,
+               conditional_input_layers='all_layers',
+               hidden_units=None,
+               input_order='left-to-right',
+               hidden_degrees='equal',
+               activation=None,
+               use_bias=True,
+               # ==========================================================
+               ## NEW: Add a flag to control Batch Normalization
+               use_batch_norm: bool = False,
+               # ==========================================================
+               kernel_initializer='glorot_uniform',
+               bias_initializer='zeros',
+               kernel_regularizer=None,
+               bias_regularizer=None,
+               kernel_constraint=None,
+               bias_constraint=None,
+               validate_args=False,
+               **kwargs):
+    """Constructs the MADE layer with optional Batch Normalization."""
+    super().__init__(**kwargs)
+
+    self._params = params
+    self._event_shape = _list(event_shape) if event_shape is not None else None
+    self._conditional = conditional
+    self._conditional_event_shape = (
+        _list(conditional_event_shape)
+        if conditional_event_shape is not None else None)
+    self._conditional_layers = conditional_input_layers
+    self._hidden_units = hidden_units if hidden_units is not None else []
+    self._input_order_param = input_order
+    self._hidden_degrees = hidden_degrees
+    self._activation = activation
+    self._use_bias = use_bias
+    # ==========================================================
+    ## NEW: Store the batch norm flag
+    self._use_batch_norm = use_batch_norm
+    # ==========================================================
+    self._kernel_initializer = kernel_initializer
+    self._bias_initializer = bias_initializer
+    self._kernel_regularizer = kernel_regularizer
+    self._bias_regularizer = bias_regularizer
+    self._kernel_constraint = tf.keras.constraints.get(kernel_constraint)
+    self._bias_constraint = bias_constraint
+    self._validate_args = validate_args
+    self._kwargs = kwargs
+
+    if self._event_shape is not None:
+      self._event_size = self._event_shape[-1]
+      self._event_ndims = len(self._event_shape)
+      if self._event_ndims != 1:
+        raise ValueError('Parameter `event_shape` must describe a rank-1 '
+                         'shape. `event_shape: {!r}`'.format(event_shape))
+
+    if self._conditional:
+      if self._event_shape is None:
+        raise ValueError('`event_shape` must be provided when '
+                         '`conditional` is True')
+      if self._conditional_event_shape is None:
+        raise ValueError('`conditional_event_shape` must be provided when '
+                         '`conditional` is True')
+      self._conditional_size = self._conditional_event_shape[-1]
+      self._conditional_ndims = len(self._conditional_event_shape)
+      if self._conditional_ndims != 1:
+        raise ValueError('Parameter `conditional_event_shape` must describe a '
+                         'rank-1 shape')
+      if not ((self._conditional_layers == 'first_layer') or
+              (self._conditional_layers == 'all_layers')):
+        raise ValueError('`conditional_input_layers` must be '
+                         '"first_layers" or "all_layers"')
+    else:
+      if self._conditional_event_shape is not None:
+        raise ValueError('`conditional_event_shape` passed but `conditional` '
+                         'is set to False.')
+
+    # To be built in `build`.
+    self._input_order = None
+    self._masks = None
+    self._network = None
+
+  def build(self, input_shape):
+    """See tfkl.Layer.build."""
+    if self._event_shape is None:
+      self._event_shape = [tf.compat.dimension_value(input_shape[-1])]
+      self._event_size = self._event_shape[-1]
+      self._event_ndims = len(self._event_shape)
+
+    if input_shape[-1] != self._event_shape[-1]:
+      raise ValueError('Invalid final dimension of `input_shape`. '
+                       'Expected `{!r}`, but got `{!r}`'.format(
+                           self._event_shape[-1], input_shape[-1]))
+
+    # Construct the masks.
+    self._input_order = _create_input_order(
+        self._event_size,
+        self._input_order_param,
+    )
+    self._masks = _make_dense_autoregressive_masks(
+        params=self._params,
+        event_size=self._event_size,
+        hidden_units=self._hidden_units,
+        input_order=self._input_order,
+        hidden_degrees=self._hidden_degrees,
+    )
+
+    outputs = [tf.keras.Input((self._event_size,), dtype=self.dtype)]
+    inputs = outputs[0]
+    if self._conditional:
+      conditional_input = tf.keras.Input((self._conditional_size,),
+                                         dtype=self.dtype)
+      inputs = [inputs, conditional_input]
+
+    # Input-to-hidden, hidden-to-hidden, and hidden-to-output layers:
+    layer_output_sizes = self._hidden_units + [self._event_size * self._params]
+    
+    ## MODIFIED BUILD LOOP to handle Batch Normalization
+    for k in range(len(self._masks)):
+      autoregressive_output = tf.keras.layers.Dense(
+          layer_output_sizes[k],
+          activation=None,  # Activation is applied manually after this
+          use_bias=self._use_bias,
+          kernel_initializer=_make_masked_initializer(
+              self._masks[k], self._kernel_initializer),
+          bias_initializer=self._bias_initializer,
+          kernel_regularizer=self._kernel_regularizer,
+          bias_regularizer=self._bias_regularizer,
+          kernel_constraint=_make_masked_constraint(
+              self._masks[k], self._kernel_constraint),
+          bias_constraint=self._bias_constraint,
+          dtype=self.dtype)(outputs[-1])
+
+      # Start with the dense output for this layer
+      current_output = autoregressive_output
+      
+      # Add conditional input if specified
+      if (self._conditional and
+          ((self._conditional_layers == 'all_layers') or
+           ((self._conditional_layers == 'first_layer') and (k == 0)))):
+        conditional_output = tf.keras.layers.Dense(
+            layer_output_sizes[k],
+            activation=None,
+            use_bias=False,
+            kernel_initializer=self._kernel_initializer,
+            dtype=self.dtype)(conditional_input)
+        current_output = tf.keras.layers.Add()([current_output, conditional_output])
+
+      # Append the result (Dense + optional Conditional) to the list of layer outputs
+      outputs.append(current_output)
+      
+      # Determine if this is a hidden layer (not the final output layer)
+      is_hidden_layer = (k + 1 < len(self._masks))
+
+      # If it's a hidden layer, apply optional Batch Norm and then Activation
+      if is_hidden_layer:
+        # Apply Batch Normalization if the flag is set
+        if self._use_batch_norm:
+            bn_output = tf.keras.layers.BatchNormalization(dtype=self.dtype)(outputs[-1])
+            outputs.append(bn_output)
+        
+        # Apply the main activation function
+        activated_output = tf.keras.layers.Activation(self._activation)(outputs[-1])
+        outputs.append(activated_output)
+
+    self._network = tf.keras.models.Model(
+        inputs=inputs,
+        outputs=outputs[-1])
+        
+    self._network.input_spec = None
+    super().build(input_shape)
+
+  def call(self, x, conditional_input=None):
+    """Transforms the inputs and returns the outputs."""
+    with tf.name_scope(self.name or 'AutoregressiveNetwork_BN_call'):
+      x = tf.convert_to_tensor(x, dtype=self.dtype, name='x')
+      input_shape = ps.shape(x)
+      if tensorshape_util.rank(x.shape) == 1:
+        x = x[tf.newaxis, ...]
+      if self._conditional:
+        if conditional_input is None:
+          raise ValueError('`conditional_input` must be passed as a named '
+                           'argument')
+        conditional_input = tf.convert_to_tensor(
+            conditional_input, dtype=self.dtype, name='conditional_input')
+        conditional_batch_shape = ps.shape(conditional_input)[:-1]
+        if tensorshape_util.rank(conditional_input.shape) == 1:
+          conditional_input = conditional_input[tf.newaxis, ...]
+        x = [x, conditional_input]
+        output_shape = ps.concat(
+            [ps.broadcast_shape(conditional_batch_shape,
+                                input_shape[:-1]),
+             input_shape[-1:]], axis=0)
+      else:
+        output_shape = input_shape
+      return tf.reshape(self._network(x),
+                        tf.concat([output_shape, [self._params]], axis=0))
+
+  def compute_output_shape(self, input_shape):
+    """See tfkl.Layer.compute_output_shape."""
+    return input_shape + (self._params,)
+
+  @property
+  def event_shape(self):
+    return self._event_shape
+
+  @property
+  def params(self):
+    return self._params
+
+# Note: This new class relies on the same helper functions (_list, _create_input_order, etc.)
+# as the original. Since it will be in the same file, this is not a problem.
 
 
 def _make_dense_autoregressive_masks(
